@@ -1,0 +1,371 @@
+---
+title: "Titanic"
+author: "Yuhao Wang & Meiyuan Li"
+date: "5/24/2017"
+output: slidy_presentation
+---
+
+```{r,echo=FALSE}
+options(warn = 0)
+```
+
+## Libraries used
+
+```{r}
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggthemes)) 
+suppressMessages(library(scales)) 
+suppressMessages(library(dplyr)) 
+suppressMessages(library(mice))
+suppressMessages(library(caret))
+```
+
+## Data Preparing
+```{r}
+df1 <- read.csv("/Users/yuhaowang/Downloads/train.csv",header=TRUE)
+df2 <- read.csv("/Users/yuhaowang/Downloads/test.csv",header=TRUE)
+df3 <- read.csv("/Users/yuhaowang/Downloads/gender_submission.csv",header=TRUE)
+#merge all subset, make it clean togther
+df2 <- inner_join(df2, df3, by = "PassengerId", type = "inner")
+df <- rbind(df1, df2)
+```
+
+## Feature Engineering
+```{r}
+#check the title
+df$Title <- gsub('(.*, )|(\\..*)', '', df$Name)
+table(df$Sex, df$Title)
+```
+```{r}
+#decrease the number of titles
+rare_title <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer')
+df$Title[df$Title == 'Mlle']  <- 'Miss' 
+df$Title[df$Title == 'Ms'] <- 'Miss'
+df$Title[df$Title == 'Mme'] <- 'Mrs' 
+df$Title[df$Title %in% rare_title]  <- 'Rare Title'
+table(df$Sex, df$Title)
+```
+```{r}
+df$Surname <- sapply(df$Name,  function(x) strsplit(as.character(x), split = '[,.]')[[1]][1])
+
+```
+
+```{r}
+df$Fsize <- df$SibSp + df$Parch + 1
+
+df$Family <- paste(df$Surname, df$Fsize, sep='_')
+
+ggplot(df[1:891,], aes(x = Fsize, fill = factor(Survived))) +
+  geom_bar(stat='count', position='dodge') +
+  scale_x_continuous(breaks=c(1:11)) +
+  labs(x = 'Family Size') +
+  theme_few()
+```
+## Fill missingness
+```{r}
+age_null_count <- sum(is.na(df$Age))
+age_null_count
+```
+
+```{r}
+
+factor_vars <- c('PassengerId','Pclass','Sex','Embarked',
+                 'Title','Surname','Family','Fsize')
+
+df[factor_vars] <- lapply(df[factor_vars],function(x) as.factor(x))
+
+set.seed(129)
+
+mice_mod <- mice(df[, !names(df) %in% c('PassengerId','Name','Ticket','Cabin','Family','Surname','Survived')], method='rf') 
+
+mice_output <- complete(mice_mod)
+```
+```{r}
+par(mfrow=c(1,2))
+hist(df$Age, freq=F, main='Age: Original Data', 
+     col='darkred', ylim=c(0,0.04))
+hist(mice_output$Age, freq=F, main='Age: MICE Output', 
+     col='red', ylim=c(0,0.04))
+
+```
+```{r}
+df$Age <- mice_output$Age
+sum(is.na(df$Age))
+```
+```{r}
+getFareNullID <- function(data){
+  count <- 0
+  for(i in 1:nrow(data))
+    if(is.na(data$Fare[i])){
+      print(i);
+      count <- count+1
+    }
+
+  return(count)
+
+}
+fare_null_count <- getFareNullID(df)
+fare_null_count
+```
+
+```{r}
+str(df[1044,])
+```
+```{r}
+
+same_farenull <- sum(df$Pclass == '3' & df$Embarked == 'S')
+
+df$Fare[1044] <- median(df[df$Pclass == '3' & df$Embarked == 'S', ]$Fare, na.rm = TRUE)
+df$Fare[1044]
+```
+```{r}
+
+getEmbarkedNullCount <- function(data) {
+  count0 <- 0
+  count <- 0
+  for(i in 1:nrow(data))
+    if(data$Embarked[i] == ""){
+
+      print(i);
+      count <- count +1
+    } 
+  return(count)
+}
+
+embarked_null_count <- getEmbarkedNullCount(df)
+embarked_null_count
+```
+
+```{r}
+embark_fare <- df %>%
+  filter(PassengerId != 62 & PassengerId != 830)
+
+ggplot(embark_fare, aes(x = Embarked, y = Fare, fill = factor(Pclass))) +
+  geom_boxplot() +
+  geom_hline(aes(yintercept=80), 
+    colour='red', linetype='dashed', lwd=2) +
+  scale_y_continuous(labels=dollar_format()) +
+  theme_few()
+```
+```{r}
+#according to the relational graph to decide the Fare
+df$Embarked[c(62, 830)] <- 'C'
+```
+
+
+```{r}
+df$AgeGroup[df$Age < 18] <- 'child'
+df$AgeGroup[df$Age >= 18 & df$Age <= 50] <- 'young'
+df$AgeGroup[df$Age > 50] <- 'old'
+
+table(df$AgeGroup,df$Survived)
+
+```
+
+```{r}
+df$IsMother <- 'Not'
+df$IsMother[df$Sex == 'female' & df$Parch > 0 & df$Age > 18 & df$Title != 'Miss'] <- 'Yes'
+
+# Show counts
+table(df$IsMother, df$Survived)
+```
+
+```{r}
+df$AgeGroup  <- factor(df$AgeGroup)
+df$IsMother <- factor(df$IsMother)
+md.pattern(df)
+```
+
+## Build and Compare different models:
+
+```{r}
+#train set
+df1 <- df[1:891,]
+#test set
+df2 <- df[892:1309,]
+```
+
+
+## Random Forest
+```{r}
+
+# Cross validation attempts to avoid overfitting
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+rf_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="rf")
+# summarize results
+print(rf_fit)
+```
+
+## KNN
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+knn_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="knn")
+# summarize results
+print(knn_fit)
+```
+## L2 Regularized Linear Support Vector Machines with Class Weights
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+svm_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="svmLinearWeights2")
+# summarize results
+print(svm_fit)
+```
+## eXtreme Gradient Boosting(xgboost)
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+xg_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="xgbTree")
+# summarize results
+print(xg_fit)
+```
+## glmnet
+
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+glmnet_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="glmnet")
+# summarize results
+print(glmnet_fit)
+```
+## naive bayes
+
+```{r}
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+nb_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="nb")
+# summarize results
+print(nb_fit)
+```
+## C5.0
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+c5_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="C5.0")
+# summarize results
+print(c5_fit)
+```
+## Bagged MARS
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+bag_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="bagEarth")
+# summarize results
+print(bag_fit)
+```
+## Neural Networks with Feature Extraction
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+nn_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="pcaNNet")
+# summarize results
+print(nn_fit)
+```
+## lda
+
+```{r}
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model
+lda_fit <- train(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + 
+                           Fare + Embarked + Title + 
+                           Fsize + AgeGroup + IsMother, data=df1,
+               trControl=train_control, method="lda")
+# summarize results
+print(lda_fit)
+```
+
+## Summarize the models
+```{r}
+results <- resamples(list(rf=rf_fit, knn=knn_fit, svm=svm_fit, xg=xg_fit, glmnet=glmnet_fit, nb=nb_fit, c5=c5_fit, bag=bag_fit, nn=nn_fit, lda=lda_fit))
+summary(results)
+```
+```{r}
+dotplot(results)
+```
+
+## Predictions on the test set (we choose top five models with high accuracy rate to predict)
+
+
+```{r}
+predictions <- predict(xg_fit, df2)
+confusionMatrix(predictions, df2$Survived)
+```
+
+```{r}
+predictions <- predict(c5_fit, df2)
+confusionMatrix(predictions, df2$Survived)
+```
+```{r}
+predictions <- predict(lda_fit, df2)
+confusionMatrix(predictions, df2$Survived)
+```
+
+```{r}
+predictions <- predict(nn_fit, df2)
+confusionMatrix(predictions, df2$Survived)
+```
+
+```{r}
+predictions <- predict(bag_fit, df2)
+confusionMatrix(predictions, df2$Survived)
+```
+### Compared to other models by testing the test set, "lda" get the highest accuracy rate (94.5%) and precision rate (96.71%). The models' accuracy rates on test set are all higher than training set, which means that the cross-validation can avoid over-fitting effectively. We also see that the bagEarth model is very excellent with a higher accuary rate (94.02%) and precision rate(96.71%) 
+
+## Important Features (In this section, we use a bagging algorithm to find out important features that decide passengers survive or not.)
+```{r}
+bag_imp<- varImp(bag_fit, scale = FALSE)
+bag_imp
+```
+```{r}
+plot(bag_imp, top = 10)
+```
+
+
+
+
